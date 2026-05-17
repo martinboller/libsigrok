@@ -301,7 +301,7 @@ m4_define([_SR_DRIVER], [
 	])], [sr_hw_info='no (disabled)'])
 	sr_driver_summary_append "$2" "$sr_hw_info"
 
-	AM_CONDITIONAL([$3], [test "x[$]$3" = xyes || test "x[$]$3" = xcheck])
+	AM_CONDITIONAL([$3], [test "x[$]$3" = xyes || test "x[$]$3" == xcheck])
 	AM_COND_IF([$3], [AC_DEFINE([HAVE_$3], [1], [Whether to support $1 device.]) AC_DEFINE([HAVE_DRIVERS], [1], [Whether at least one driver is enabled.])])
 ])
 
@@ -336,7 +336,7 @@ SR_DRIVER([GMC MH 1x/2x], [gmc-mh-1x-2x], [serial_comm])
 SR_DRIVER([Great Scott Gadgets GreatFET One], [greatfet], [libusb])
 SR_DRIVER([GW Instek GDS-800], [gwinstek-gds-800], [serial_comm])
 SR_DRIVER([GW Instek GPD], [gwinstek-gpd], [serial_comm])
-SR_DRIVER([GW Instek PSP], [gwinstek-psp], [serial_comm])
+SR_DRIVER([GW Instek PSP], [gwinstek-psp])
 SR_DRIVER([Hameg HMO], [hameg-hmo])
 SR_DRIVER([Hantek 4032L], [hantek-4032l], [libusb])
 SR_DRIVER([Hantek 6xxx], [hantek-6xxx], [libusb])
@@ -385,6 +385,7 @@ SR_DRIVER([serial DMM], [serial-dmm], [serial_comm])
 SR_DRIVER([serial LCR], [serial-lcr], [serial_comm])
 SR_DRIVER([SIGLENT SDL10x0], [siglent-sdl10x0])
 SR_DRIVER([Siglent SDS], [siglent-sds])
+SR_DRIVER([Sipeed Slogic Analyzer], [sipeed-slogic-analyzer])
 SR_DRIVER([Sysclk LWLA], [sysclk-lwla], [libusb])
 SR_DRIVER([Sysclk SLA5032], [sysclk-sla5032], [libusb])
 SR_DRIVER([Teleinfo], [teleinfo], [serial_comm])
@@ -476,7 +477,7 @@ AS_IF([test "x$HAVE_DOXYGEN" != xyes],
 SR_SEARCH_LIBS([SR_EXTRA_CXX_LIBS], [__cxa_throw], [gnustl_shared])
 
 # Python is needed for the C++ bindings.
-AM_PATH_PYTHON([3.8],
+AM_PATH_PYTHON([2.7],
 	[HAVE_PYTHON=yes],
 	[HAVE_PYTHON=no
 	SR_APPEND([sr_cxx_missing], [', '], [Python])])
@@ -519,7 +520,7 @@ sr_pymajor=${PYTHON_VERSION%%.*}
 sr_pyminor=${PYTHON_VERSION#*.}
 
 # The Python bindings need Python development files. Check for either
-# Python 3 headers depending on the interpreter version.
+# Python 3 or Python 2 headers depending on the interpreter version.
 SR_PKG_CHECK([python_dev], [SR_PKGLIBS_PYTHON],
 	[python = $PYTHON_VERSION],
 	[python$sr_pymajor = $PYTHON_VERSION],
@@ -665,7 +666,7 @@ AM_CONDITIONAL([BINDINGS_JAVA], [test "x$BINDINGS_JAVA" = xyes])
 ##############################
 
 # Add mandatory dependencies to module list.
-SR_APPEND([SR_PKGLIBS], ['libzip >= 0.11'])
+SR_APPEND([SR_PKGLIBS], ['libzip >= 0.10'])
 AC_SUBST([SR_PKGLIBS])
 
 # Retrieve the compile and link flags for all modules combined.
@@ -744,7 +745,7 @@ Compile configuration:
 
 Detected libraries (required):
  - glib-2.0 >= 2.32.0.............. $sr_glib_version
- - libzip >= 0.11.................. $sr_libzip_version
+ - libzip >= 0.10.................. $sr_libzip_version
 
 Detected libraries (optional):
 $sr_pkglibs_summary
