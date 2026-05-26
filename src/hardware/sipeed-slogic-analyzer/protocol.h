@@ -28,149 +28,96 @@
 
 #define LOG_PREFIX "sipeed-slogic-analyzer"
 
-#define EP_IN 0x01
-#define SIZE_MAX_EP_HS 512
+#define USB_VID_SIPEED UINT16_C(0x359f)
 #define NUM_MAX_TRANSFERS 64
+#define TRANSFERS_DURATION_TOLERANCE 0.05f
 
-static const uint64_t samplerates[] = {
-	/* 160M = 2*2*2*2*2*5M */
-	SR_MHZ(1),
-	SR_MHZ(2),
-	SR_MHZ(4),
-	SR_MHZ(5),
-	SR_MHZ(8),
-	SR_MHZ(10),
-	SR_MHZ(16),
-	SR_MHZ(20),
-	SR_MHZ(32),
-	SR_MHZ(36),
-	SR_MHZ(40),
-	/* x 4ch */
-	SR_MHZ(64),
-	SR_MHZ(80),
-	/* x 2ch */
-	SR_MHZ(120),
-	SR_MHZ(128),
-	SR_MHZ(144),
-	SR_MHZ(160),
+enum {
+	PATTERN_MODE_NOMAL,
+	PATTERN_MODE_TEST_MAX_SPEED,
+};
+
+struct slogic_model {
+	char *name;
+	uint16_t pid;
+	uint8_t ep_in;
+	uint64_t max_samplerate; // limit by hardware
+	uint64_t max_samplechannel; // limit by hardware
+	uint64_t max_bandwidth; // limit by hardware
+	struct {
+		int (*remote_run)(const struct sr_dev_inst *sdi);
+		int (*remote_stop)(const struct sr_dev_inst *sdi);
+	} operation;
+	void (*submit_raw_data)(void *data, size_t len, const struct sr_dev_inst *sdi);
 };
 
 struct dev_context {
+	struct slogic_model *model;
+
+	struct sr_channel_group *digital_group;
+
 	struct {
-		uint64_t limit_samples;
-		uint64_t cur_samplerate;
-		uint64_t cur_samplechannel;
+		uint64_t limit_samplerate;
+		uint64_t limit_samplechannel;
 	};
 
-	uint64_t num_transfers;
-	struct libusb_transfer *transfers[NUM_MAX_TRANSFERS];
+	struct {
+		uint64_t cur_limit_samples;
+		uint64_t cur_samplerate;
+		uint64_t cur_samplechannel;
+		int64_t cur_pattern_mode_idx;
+	}; // configuration
 
-	gboolean acq_aborted;
+	struct {
+		enum libusb_speed speed;
 
-	uint64_t timeout;
+		uint64_t samples_need_nbytes;
+		uint64_t samples_got_nbytes;
 
-	size_t transfers_buffer_size;
+		uint64_t per_transfer_duration; /* unit: ms */
+		uint64_t per_transfer_nbytes;
 
-	size_t bytes_need_transfer;
-	size_t bytes_transferring;
-	size_t bytes_transfered;
-	size_t transfers_used;
+		size_t num_transfers_completed;
+		size_t num_transfers_used;
+		struct libusb_transfer *transfers[NUM_MAX_TRANSFERS];
 
+		uint64_t transfers_reached_nbytes; /* real received bytes in all */
+		uint64_t transfers_reached_nbytes_latest; /* real received bytes this transfer */
+		int64_t transfers_reached_time_start;
+		int64_t transfers_reached_time_latest;
+
+		GThread *raw_data_handle_thread;
+		GAsyncQueue *raw_data_queue;
+		uint64_t timeout_count;
+	}; // usb
+
+	int acq_aborted;
+
+	/* Triggers */
+	uint64_t capture_ratio;
 	gboolean trigger_fired;
 	struct soft_trigger_logic *stl;
 
-	uint64_t num_frames;
-	uint64_t sent_samples;
-	int submitted_transfers;
-	int empty_transfer_count;
-
-
 	double voltage_threshold[2];
-	/* Triggers */
-	uint64_t capture_ratio;
 };
-
-static inline void devc_set_samplerate(struct dev_context *devc, uint64_t new_samplerate) {
-	devc->cur_samplerate = new_samplerate;
-	if (new_samplerate >= SR_MHZ(120)) {
-		devc->cur_samplechannel = 2;
-	} else if (new_samplerate >= SR_MHZ(40)) {
-		devc->cur_samplechannel = 4;
-	} else {
-		devc->cur_samplechannel = 8;
-	}
-	sr_info("rebind sample channel to %uCH", devc->cur_samplechannel);
-}
-
-#pragma pack(push, 1)
-struct cmd_start_acquisition {
-  union {
-    struct {
-      uint8_t sample_rate_l;
-      uint8_t sample_rate_h;
-    };
-    uint16_t sample_rate;
-  };
-	uint8_t sample_channel;
-};
-#pragma pack(pop)
-
-/* Protocol commands */
-#define CMD_START	0xb1
-#define CMD_STOP	0xb3
 
 SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi);
 SR_PRIV int sipeed_slogic_acquisition_stop(struct sr_dev_inst *sdi);
 
-static inline size_t to_bytes_per_ms(struct dev_context *devc)
-{
-	return (devc->cur_samplerate * devc->cur_samplechannel) / 8 / 1000;
-}
+static inline void clear_ep(const struct sr_dev_inst *sdi) {
+	struct dev_context *devc = sdi->priv;
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	uint8_t ep = devc->model->ep_in;
 
-static inline size_t get_buffer_size(struct dev_context *devc)
-{
-	/**
-	 * The buffer should be large enough to hold 10ms of data and
-	 * a multiple of 210 * 512.
-	 */
-	// const size_t pack_size = SIZE_MAX_EP_HS;
-	// size_t s = 10 * to_bytes_per_ms(devc);
-	// size_t rem = s % (210 * pack_size);
-	// if (rem) s += 210 * pack_size - rem;
-	// return s;
-	return 210 * SIZE_MAX_EP_HS;
-}
-
-static inline size_t get_number_of_transfers(struct dev_context *devc)
-{
-	/* Total buffer size should be able to hold about 500ms of data. */
-	// size_t s = 500 * to_bytes_per_ms(devc);
-	// size_t n = s / get_buffer_size(devc);
-	// size_t rem = s % get_buffer_size(devc);
-	// if (rem) n += 1;
-	// if (n > NUM_MAX_TRANSFERS)
-	// 	return NUM_MAX_TRANSFERS;
-	// return n;
-	return 1;
-}
-
-static inline size_t get_timeout(struct dev_context *devc)
-{
-	size_t total_size = get_buffer_size(devc) *
-			get_number_of_transfers(devc);
-	size_t timeout = total_size / to_bytes_per_ms(devc);
-	return timeout * 5 / 4; /* Leave a headroom of 25% percent. */
-}
-
-static inline void clear_ep(uint8_t ep, libusb_device_handle *usbh) {
-	sr_dbg("Clearring EP: %u", ep);
-	uint8_t tmp[512];
+	size_t tmp_size = 4 * 1024 * 1024;
+	uint8_t *tmp = malloc(tmp_size);
 	int actual_length = 0;
 	do {
-		libusb_bulk_transfer(usbh, ep | LIBUSB_ENDPOINT_IN,
-				tmp, sizeof(tmp), &actual_length, 100);
+		libusb_bulk_transfer(usb->devhdl, ep,
+				tmp, tmp_size, &actual_length, 100);
 	} while (actual_length);
-	sr_dbg("Cleared EP: %u", ep);
+	free(tmp);
+	sr_dbg("Cleared EP: 0x%02x", ep);
 }
 
 #endif
