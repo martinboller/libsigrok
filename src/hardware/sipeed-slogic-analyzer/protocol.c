@@ -23,17 +23,10 @@
 #include <string.h>
 #include "protocol.h"
 
-/* Max buffering limit. 100 items * 125ms per transfer provides ~12.5 seconds
- * of thread scheduling jitter protection while keeping RAM strictly bounded. */
-/* Max queue depth = max RAM for buffering / devc->per_transfer_nbytes
-For 1 GB Buffer Limit: 80 items max depth.
-For 4 GB Buffer Limit: 320 items max depth.
-For 8 GB Buffer Limit: 640 max depth.
-*/
-#define MAX_QUEUE_DEPTH 1920
+/* Magic cookie macro to bypass GLib NULL pointer checks securely */
+#define SHUTDOWN_MARKER GINT_TO_POINTER(0xDEAD)
 
 static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer) {
-    int ret;
     const struct sr_dev_inst *sdi;
     struct dev_context *devc;
 
@@ -50,56 +43,36 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer) {
             devc->transfers_reached_nbytes_latest = transfer->actual_length;
             devc->transfers_reached_nbytes += devc->transfers_reached_nbytes_latest;
             
+            /* Bound the actual transfer length to precisely what remains requested */
             if ((uint64_t)transfer->actual_length > devc->samples_need_nbytes - devc->samples_got_nbytes)
                 transfer->actual_length = devc->samples_need_nbytes - devc->samples_got_nbytes;
             
             devc->samples_got_nbytes += transfer->actual_length;
             devc->transfers_reached_time_latest = transfers_reached_time_now;
 
-            if (transfer->actual_length == 0) {
+            /* Check if the capture window has fully closed */
+            if (devc->samples_got_nbytes >= devc->samples_need_nbytes) {
+                devc->acq_aborted = 1;
+            }
+
+            /* If length is 0 or aborted, destroy right here. */
+            if (transfer->actual_length == 0 || devc->acq_aborted) {
                 devc->num_transfers_used -= 1;
+                g_free(transfer->buffer);
+                libusb_free_transfer(transfer);
+                
+                /* Safely notify worker thread ONLY if this was the last ring block */
+                if (devc->num_transfers_used == 0 && devc->raw_data_queue) {
+                    g_async_queue_push(devc->raw_data_queue, SHUTDOWN_MARKER);
+                }
                 break;
             }
 
-            if (devc->cur_pattern_mode_idx != PATTERN_MODE_TEST_MAX_SPEED) {
-                uint8_t *d = transfer->buffer;
-                size_t len = transfer->actual_length;
-
-                /* Thread-safe check on queue depth boundary */
-                if (g_async_queue_length(devc->raw_data_queue) < MAX_QUEUE_DEPTH) {
-                    uint8_t *ptr = g_malloc(devc->per_transfer_nbytes);
-                    if (!ptr) {
-                        sr_err("Failed to allocate memory: %" PRIu64 " bytes!", devc->per_transfer_nbytes);
-                        devc->acq_aborted = 1;
-                        devc->num_transfers_used -= 1;
-                        break;
-                    }
-                    /* Swap buffer out to the consumer thread queue */
-                    transfer->buffer = ptr; 
-                    g_async_queue_push(devc->raw_data_queue, d);
-                } else {
-                    /* Queue full: Safely drop payload. Keep transfer->buffer 
-                     * attached so libusb can reuse it on the next submission. */
-                    sr_warn("Queue limit reached! Safely bypassing chunk of %zu bytes to prevent OOM.", len);
-                }
-            }
-
-            devc->num_transfers_used -= 1;
-            
-            /* Resubmit transfer if we still need more samples and haven't aborted */
-            if (!devc->acq_aborted && (devc->samples_got_nbytes + devc->num_transfers_used * devc->per_transfer_nbytes < devc->samples_need_nbytes)) {
-                transfer->actual_length = 0;
-                transfer->timeout = (TRANSFERS_DURATION_TOLERANCE + 1) * devc->per_transfer_duration * (devc->num_transfers_used + 2);
-                ret = libusb_submit_transfer(transfer);
-                if (ret) {
-                    sr_dbg("Failed to submit transfer: %s", libusb_error_name(ret));
-                    g_free(transfer->buffer);
-                    libusb_free_transfer(transfer);
-                } else {
-                    devc->num_transfers_used += 1;
-                }
+            if (devc->cur_pattern_mode_idx != PATTERN_MODE_TEST_MAX_SPEED && devc->raw_data_queue) {
+                /* Zero Allocation: Pass the complete transfer context to the worker thread queue */
+                g_async_queue_push(devc->raw_data_queue, transfer);
             } else {
-                /* Not resubmitting: Free data immediately to prevent shutdown leaks */
+                devc->num_transfers_used -= 1;
                 g_free(transfer->buffer);
                 libusb_free_transfer(transfer);
             }
@@ -110,17 +83,15 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer) {
         case LIBUSB_TRANSFER_STALL:
         case LIBUSB_TRANSFER_NO_DEVICE:
         default: {
-            /* Crucial Fix: Any aborted, cancelled or failed transfer catches here, 
-             * cleaning up both its tracking buffer and contextual hardware handle. */
             sr_dbg("Transfer returned with terminal status: %s.", libusb_error_name(transfer->status));
             g_free(transfer->buffer);
             libusb_free_transfer(transfer);
             devc->num_transfers_used -= 1;
+            
+            if (devc->num_transfers_used == 0 && devc->raw_data_queue) {
+                g_async_queue_push(devc->raw_data_queue, SHUTDOWN_MARKER);
+            }
         } break;
-    }
-
-    if (devc->num_transfers_used == 0) {
-        devc->acq_aborted = 1;
     }
 
     devc->num_transfers_completed += 1;
@@ -143,8 +114,7 @@ static int handle_events(int fd, int revents, void *cb_data)
 
     if (devc->acq_aborted) {
         if (devc->num_transfers_used > 0) {
-            /* Actively cancel running transfers; their cleanup will 
-             * hit the case branches inside receive_transfer callback */
+            /* Cancel any remaining physical transfers left in flight */
             for (size_t i = 0; i < NUM_MAX_TRANSFERS; ++i) {
                 struct libusb_transfer *transfer = devc->transfers[i];
                 if (transfer) {
@@ -153,18 +123,24 @@ static int handle_events(int fd, int revents, void *cb_data)
                 }
             }
         } else {
-            /* Everything has completely unwound from the hardware layer.
-             * Safe to stop data loop, join worker thread, and dismantle queue structures */
+            /* Force unblock worker thread if it's idling on empty queue */
+            if (devc->raw_data_queue) {
+                g_async_queue_push(devc->raw_data_queue, SHUTDOWN_MARKER);
+            }
+
             if (devc->raw_data_handle_thread) {
                 g_thread_join(devc->raw_data_handle_thread);
                 devc->raw_data_handle_thread = NULL;
             }
 
             if (devc->raw_data_queue) {
-                /* Flush out any remnants sitting inside queue */
-                uint8_t *remain_data;
-                while ((remain_data = g_async_queue_try_pop(devc->raw_data_queue)) != NULL) {
-                    g_free(remain_data);
+                gpointer xfer;
+                while ((xfer = g_async_queue_try_pop(devc->raw_data_queue)) != NULL) {
+                    if (xfer != SHUTDOWN_MARKER) {
+                        struct libusb_transfer *t = (struct libusb_transfer *)xfer;
+                        g_free(t->buffer);
+                        libusb_free_transfer(t);
+                    }
                 }
                 g_async_queue_unref(devc->raw_data_queue);
                 devc->raw_data_queue = NULL;
@@ -184,24 +160,43 @@ static gpointer raw_data_handle_thread_func(gpointer user_data)
 {
     struct sr_dev_inst *sdi = user_data;
     struct dev_context *devc = sdi->priv;
-    size_t len = devc->per_transfer_nbytes;
 
     while (1) {
-        uint8_t *raw_data = g_async_queue_try_pop(devc->raw_data_queue);
+        gpointer data = g_async_queue_pop(devc->raw_data_queue);
         
-        if (raw_data != NULL) {
+        if (data != NULL && data != SHUTDOWN_MARKER) {
+            struct libusb_transfer *transfer = (struct libusb_transfer *)data;
+            
             if (devc->trigger_fired) {
-                devc->model->submit_raw_data(raw_data, len, sdi);
+                devc->model->submit_raw_data(transfer->buffer, transfer->actual_length, sdi);
             }
-            g_free(raw_data); 
+
+            /* Recycle the block if sampling criteria are still unfulfilled */
+            if (!devc->acq_aborted && (devc->samples_got_nbytes < devc->samples_need_nbytes)) {
+                transfer->actual_length = 0;
+                int ret = libusb_submit_transfer(transfer);
+                if (ret) {
+                    sr_dbg("Failed to resubmit recycled transfer: %s", libusb_error_name(ret));
+                    devc->num_transfers_used -= 1;
+                    g_free(transfer->buffer);
+                    libusb_free_transfer(transfer);
+                }
+            } else {
+                /* Target size reached or acquisition aborted: decommission and free the block */
+                devc->num_transfers_used -= 1;
+                g_free(transfer->buffer);
+                libusb_free_transfer(transfer);
+                
+                if (devc->num_transfers_used == 0) {
+                    devc->acq_aborted = 1;
+                    std_session_send_df_end(sdi);
+                    break;
+                }
+            }
         } else {
-            /* Thread Exit Strategy: Only break if acquisition is declared dead 
-             * by parent thread AND our data work pipeline is empty. */
-            if (devc->acq_aborted) {
-                std_session_send_df_end(sdi);
-                break;
-            }
-            g_usleep(100);
+            /* We received our explicit cookie shutdown marker or an unexpected event. Exit. */
+            std_session_send_df_end(sdi);
+            break;
         }
     }
 
@@ -234,66 +229,10 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
             devc->cur_samplerate > 0 ? (1000 * devc->cur_limit_samples / devc->cur_samplerate) : 0
     );
 
-    devc->per_transfer_duration = 125;
+    /* Setup ~40ms burst durations to yield more optimal filesystem page-cache alignments */
+    devc->per_transfer_duration = 40;
     devc->per_transfer_nbytes = devc->per_transfer_duration * devc->cur_samplerate * devc->cur_samplechannel / 8 / SR_KHZ(1);
-
-    do {
-        struct libusb_transfer *transfer = libusb_alloc_transfer(0);
-        if (!transfer) {
-            sr_err("Failed to allocate libusb transfer!");
-            return SR_ERR_IO;
-        }
-        do {
-            devc->per_transfer_nbytes = (devc->per_transfer_nbytes + (2 * 16 * 1024 - 1)) & ~(2 * 16 * 1024 - 1);
-            if (devc->cur_samplerate * devc->cur_samplechannel > 0) {
-                devc->per_transfer_duration = devc->per_transfer_nbytes * SR_KHZ(1) * 8 / (devc->cur_samplerate * devc->cur_samplechannel);
-            }
-            sr_dbg("Plan to receive %" PRIu64 " bytes per %" PRIu64 "ms...", devc->per_transfer_nbytes, devc->per_transfer_duration);
-            
-            uint8_t *dev_buf = g_malloc(devc->per_transfer_nbytes);
-            if (!dev_buf) {
-                sr_dbg("Failed to allocate memory: %" PRIu64 " bytes! Halving allocation boundary.", devc->per_transfer_nbytes);
-                devc->per_transfer_nbytes >>= 1;
-                continue;
-            }
-
-            libusb_fill_bulk_transfer(transfer, usb->devhdl, devc->model->ep_in,
-                                        dev_buf, (int)devc->per_transfer_nbytes, NULL,
-                                        NULL, 0);
-
-            ret = libusb_submit_transfer(transfer);
-            if (ret) {
-                g_free(transfer->buffer);
-                if (ret == LIBUSB_ERROR_NO_MEM) {
-                    sr_dbg("Failed to submit transfer: %s!", libusb_error_name(ret));
-                    devc->per_transfer_nbytes >>= 1;
-                    continue;
-                } else {
-                    sr_err("Failed to submit transfer: %s!", libusb_error_name(ret));
-                    libusb_free_transfer(transfer);
-                    return SR_ERR_IO;
-                }
-            } else {
-                ret = libusb_cancel_transfer(transfer);
-                if (ret) {
-                    sr_dbg("Failed to cancel transfer: %s!", libusb_error_name(ret));
-                }
-                libusb_handle_events_timeout_completed(drvc->sr_ctx->libusb_ctx, &(struct timeval){3, 0}, NULL);
-                g_free(transfer->buffer);
-
-                devc->per_transfer_nbytes >>= 1;
-                uint64_t divisor = (devc->cur_samplerate / SR_KHZ(1) * devc->cur_samplechannel / 8);
-                devc->per_transfer_duration = divisor > 0 ? (devc->per_transfer_nbytes / divisor) : 1;
-                
-                if (devc->per_transfer_duration == 0) {
-                    devc->per_transfer_duration = 1;
-                }
-                break;
-            }
-        } while (devc->per_transfer_nbytes > 32 * 1024);
-        libusb_free_transfer(transfer);
-        sr_info("Nice plan! :) => %" PRIu64 " bytes per %" PRIu64 "ms.", devc->per_transfer_nbytes, devc->per_transfer_duration);
-    } while (0);
+    devc->per_transfer_nbytes = (devc->per_transfer_nbytes + (2 * 16 * 1024 - 1)) & ~(2 * 16 * 1024 - 1);
 
     devc->acq_aborted = 0;
     devc->num_transfers_used = 0;
@@ -315,6 +254,7 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
         return SR_ERR_MALLOC;
     }
 
+    /* Seed the pre-allocated ring buffer memory layout blocks */
     while (devc->num_transfers_used < NUM_MAX_TRANSFERS && devc->samples_got_nbytes + devc->num_transfers_used * devc->per_transfer_nbytes < devc->samples_need_nbytes)
     {
         uint8_t *dev_buf = g_malloc(devc->per_transfer_nbytes);
@@ -360,10 +300,7 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
     std_session_send_df_frame_begin(sdi);
 
     uint32_t polling_interval = (uint32_t)(devc->per_transfer_duration / 2);
-    if (polling_interval == 0) {
-        polling_interval = 1;
-    }
-    sr_session_source_add(sdi->session, -1 * (size_t)drvc->sr_ctx->libusb_ctx, 0, (int)polling_interval, handle_events, (void *)sdi);
+    sr_session_source_add(sdi->session, -1 * (size_t)drvc->sr_ctx->libusb_ctx, 0, (int)(polling_interval ? polling_interval : 1), handle_events, (void *)sdi);
 
     devc->trigger_fired = TRUE;
     if ((ret = devc->model->operation.remote_run(sdi)) < 0) {
@@ -384,6 +321,11 @@ SR_PRIV int sipeed_slogic_acquisition_stop(struct sr_dev_inst *sdi)
 
     devc->trigger_fired = FALSE;
     devc->acq_aborted = 1;
+
+    /* Wake up the consumer handling thread safely using our non-NULL cookie token */
+    if (devc->raw_data_queue) {
+        g_async_queue_push(devc->raw_data_queue, SHUTDOWN_MARKER);
+    }
 
     return SR_OK;
 }
