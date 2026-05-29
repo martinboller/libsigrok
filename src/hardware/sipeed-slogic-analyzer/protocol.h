@@ -2,6 +2,7 @@
  * This file is part of the libsigrok project.
  *
  * Copyright (C) 2023 taorye <taorye@outlook.com>
+ * Copyright (C) 2026 Martin <martin@bollers.dk> with help from different LLM's
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -33,7 +34,7 @@
 #define TRANSFERS_DURATION_TOLERANCE 0.05f
 
 enum {
-	PATTERN_MODE_NOMAL,
+	PATTERN_MODE_NORMAL,
 	PATTERN_MODE_TEST_MAX_SPEED,
 };
 
@@ -66,8 +67,9 @@ struct dev_context {
 		uint64_t cur_samplerate;
 		uint64_t cur_samplechannel;
 		int64_t cur_pattern_mode_idx;
+		size_t cur_threshold_idx;
 	}; // configuration
-
+	
 	struct {
 		enum libusb_speed speed;
 
@@ -99,6 +101,7 @@ struct dev_context {
 	struct soft_trigger_logic *stl;
 
 	double voltage_threshold[2];
+	double cur_voltage_threshold;
 };
 
 SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi);

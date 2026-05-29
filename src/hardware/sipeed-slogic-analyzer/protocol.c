@@ -2,7 +2,7 @@
  * This file is part of the libsigrok project.
  *
  * Copyright (C) 2023 taorye <taorye@outlook.com>
- * Copyright (C) 2026 AI Collaborator <gemini@google.com>
+ * Copyright (C) 2026 Martin <martin@bollers.dk> with help from different LLM's
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -23,7 +23,7 @@
 #include <string.h>
 #include "protocol.h"
 
-/* Magic cookie macro to bypass GLib NULL pointer checks securely */
+// Magic cookie macro to bypass GLib NULL pointer checks securely
 #define SHUTDOWN_MARKER GINT_TO_POINTER(0xDEAD)
 
 static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer) {
@@ -43,25 +43,25 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer) {
             devc->transfers_reached_nbytes_latest = transfer->actual_length;
             devc->transfers_reached_nbytes += devc->transfers_reached_nbytes_latest;
             
-            /* Bound the actual transfer length to precisely what remains requested */
+            // Actual transfer bound to match precisely what remains requested
             if ((uint64_t)transfer->actual_length > devc->samples_need_nbytes - devc->samples_got_nbytes)
                 transfer->actual_length = devc->samples_need_nbytes - devc->samples_got_nbytes;
             
             devc->samples_got_nbytes += transfer->actual_length;
             devc->transfers_reached_time_latest = transfers_reached_time_now;
 
-            /* Check if the capture window has fully closed */
+            // Check if capture window has fully closed
             if (devc->samples_got_nbytes >= devc->samples_need_nbytes) {
                 devc->acq_aborted = 1;
             }
 
-            /* If length is 0 or aborted, destroy right here. */
+            // If length is 0 or aborted, destroy right here.
             if (transfer->actual_length == 0 || devc->acq_aborted) {
                 devc->num_transfers_used -= 1;
                 g_free(transfer->buffer);
                 libusb_free_transfer(transfer);
                 
-                /* Safely notify worker thread ONLY if this was the last ring block */
+                // Notify worker thread ONLY if this was the last ring block
                 if (devc->num_transfers_used == 0 && devc->raw_data_queue) {
                     g_async_queue_push(devc->raw_data_queue, SHUTDOWN_MARKER);
                 }
@@ -69,7 +69,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer) {
             }
 
             if (devc->cur_pattern_mode_idx != PATTERN_MODE_TEST_MAX_SPEED && devc->raw_data_queue) {
-                /* Zero Allocation: Pass the complete transfer context to the worker thread queue */
+                // Zero Allocation: Pass the complete transfer context to the worker thread queue
                 g_async_queue_push(devc->raw_data_queue, transfer);
             } else {
                 devc->num_transfers_used -= 1;
@@ -114,7 +114,7 @@ static int handle_events(int fd, int revents, void *cb_data)
 
     if (devc->acq_aborted) {
         if (devc->num_transfers_used > 0) {
-            /* Cancel any remaining physical transfers left in flight */
+            // Cancel any remaining physical transfers left
             for (size_t i = 0; i < NUM_MAX_TRANSFERS; ++i) {
                 struct libusb_transfer *transfer = devc->transfers[i];
                 if (transfer) {
@@ -123,7 +123,7 @@ static int handle_events(int fd, int revents, void *cb_data)
                 }
             }
         } else {
-            /* Force unblock worker thread if it's idling on empty queue */
+            // Force unblock of worker thread if it si idling on empty queue
             if (devc->raw_data_queue) {
                 g_async_queue_push(devc->raw_data_queue, SHUTDOWN_MARKER);
             }
@@ -171,7 +171,7 @@ static gpointer raw_data_handle_thread_func(gpointer user_data)
                 devc->model->submit_raw_data(transfer->buffer, transfer->actual_length, sdi);
             }
 
-            /* Recycle the block if sampling criteria are still unfulfilled */
+            // Recycle the block if sampling criteria still unfulfilled
             if (!devc->acq_aborted && (devc->samples_got_nbytes < devc->samples_need_nbytes)) {
                 transfer->actual_length = 0;
                 int ret = libusb_submit_transfer(transfer);
@@ -182,7 +182,7 @@ static gpointer raw_data_handle_thread_func(gpointer user_data)
                     libusb_free_transfer(transfer);
                 }
             } else {
-                /* Target size reached or acquisition aborted: decommission and free the block */
+                // Target size reached or acquisition aborted: decommission and free the block
                 devc->num_transfers_used -= 1;
                 g_free(transfer->buffer);
                 libusb_free_transfer(transfer);
@@ -194,7 +194,7 @@ static gpointer raw_data_handle_thread_func(gpointer user_data)
                 }
             }
         } else {
-            /* We received our explicit cookie shutdown marker or an unexpected event. Exit. */
+            // Explicit cookie shutdown marker received. Stop and exit thread cleanly.
             std_session_send_df_end(sdi);
             break;
         }
@@ -209,6 +209,8 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
     struct drv_context *drvc;
     struct sr_usb_dev_inst *usb;
     int ret;
+    GSList *l;
+    size_t active_channels = 0;
 
     devc = sdi->priv;
     drvc = sdi->driver->context;
@@ -219,9 +221,25 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
         return ret;
     }
 
+    // Track exactly how many channels are ticked in PulseView to configure possible limits
+    for (l = sdi->channels; l; l = l->next) {
+        struct sr_channel *ch = l->data;
+        if (ch->enabled && ch->type == SR_CHANNEL_LOGIC)
+            active_channels++;
+    }
+    if (active_channels == 0) active_channels = devc->cur_samplechannel;
+    
+    // Commit layout change dynamically right before starting hardware pipes
+    devc->cur_samplechannel = active_channels;
+
     devc->samples_got_nbytes = 0;
     devc->samples_need_nbytes = devc->cur_limit_samples * devc->cur_samplechannel / 8;
     
+    // Safety catch to ensure minimal buffer calculations do not zero out
+    if (devc->samples_need_nbytes == 0) {
+        devc->samples_need_nbytes = 4096; 
+    }
+
     sr_info("Need %" PRIu64 "x %" PRIu64 "ch@%" PRIu64 "MHz in %" PRIu64 "ms.", 
             devc->cur_limit_samples,
             devc->cur_samplechannel, 
@@ -229,7 +247,7 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
             devc->cur_samplerate > 0 ? (1000 * devc->cur_limit_samples / devc->cur_samplerate) : 0
     );
 
-    /* Setup ~40ms burst durations to yield more optimal filesystem page-cache alignments */
+    // Setup app. 40ms burst durations to yield optimal filesystem page-cache alignments
     devc->per_transfer_duration = 40;
     devc->per_transfer_nbytes = devc->per_transfer_duration * devc->cur_samplerate * devc->cur_samplechannel / 8 / SR_KHZ(1);
     devc->per_transfer_nbytes = (devc->per_transfer_nbytes + (2 * 16 * 1024 - 1)) & ~(2 * 16 * 1024 - 1);
@@ -254,7 +272,7 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
         return SR_ERR_MALLOC;
     }
 
-    /* Seed the pre-allocated ring buffer memory layout blocks */
+    // Seed the pre-allocated ring buffer memory layout blocks
     while (devc->num_transfers_used < NUM_MAX_TRANSFERS && devc->samples_got_nbytes + devc->num_transfers_used * devc->per_transfer_nbytes < devc->samples_need_nbytes)
     {
         uint8_t *dev_buf = g_malloc(devc->per_transfer_nbytes);
@@ -322,7 +340,7 @@ SR_PRIV int sipeed_slogic_acquisition_stop(struct sr_dev_inst *sdi)
     devc->trigger_fired = FALSE;
     devc->acq_aborted = 1;
 
-    /* Wake up the consumer handling thread safely using our non-NULL cookie token */
+    // Wake up the consumer handling thread safely using non-NULL cookie token
     if (devc->raw_data_queue) {
         g_async_queue_push(devc->raw_data_queue, SHUTDOWN_MARKER);
     }
