@@ -84,11 +84,10 @@ static const struct slogic_model support_models[] = {
 };
 
 static const uint64_t samplerates[] = {
-    SR_MHZ(1),   SR_MHZ(2),   SR_MHZ(4),   SR_MHZ(5),
-    SR_MHZ(8),   SR_MHZ(10),  SR_MHZ(16),  SR_MHZ(20),
-    SR_MHZ(32),  SR_MHZ(40),  SR_MHZ(80),  SR_MHZ(125),
-    SR_MHZ(160), SR_MHZ(200), SR_MHZ(400), SR_MHZ(800),
-    SR_MHZ(1600),
+    SR_MHZ(5),   SR_MHZ(8),   SR_MHZ(10),  SR_MHZ(16),  
+    SR_MHZ(20),  SR_MHZ(25),  SR_MHZ(32),  SR_MHZ(50),  
+    SR_MHZ(80),  SR_MHZ(100), SR_MHZ(160), SR_MHZ(200), 
+    SR_MHZ(400), SR_MHZ(800), SR_MHZ(1600),
 };
 
 static const uint64_t buffersizes[] = {
@@ -415,26 +414,32 @@ static int config_list(uint32_t key, GVariant **data, const struct sr_dev_inst *
         devc = sdi->priv;
 
     switch (key) {
+    /* --- START OF IMPLEMENTED REPLACEMENT --- */
     case SR_CONF_SAMPLERATE:
         if (!devc) {
+            /* If no device context exists yet, expose all supported samplerates */
             *data = std_gvar_samplerates(samplerates, G_N_ELEMENTS(samplerates));
             return SR_OK;
         }
 
+        /* Calculate how many channels are currently checked/enabled by the user */
         for (l = sdi->channels; l; l = l->next) {
             struct sr_channel *ch = l->data;
             if (ch->enabled && ch->type == SR_CHANNEL_LOGIC)
                 active_channels++;
         }
         
+        /* Fallback if no channels are explicitly enabled yet */
         if (active_channels == 0)
             active_channels = devc->model->max_samplechannel;
 
+        /* Enforce dynamic bandwidth cap rules based on active channels */
         uint64_t max_allowed_rate;
         if (active_channels <= 4)       max_allowed_rate = SR_MHZ(800);
         else if (active_channels <= 8)  max_allowed_rate = SR_MHZ(400);
         else                            max_allowed_rate = SR_MHZ(200);
 
+        /* Filter the standard samplerates array up to the permitted cap */
         for (num_samplerates = 0; num_samplerates < G_N_ELEMENTS(samplerates); num_samplerates++) {
             if (samplerates[num_samplerates] > max_allowed_rate) {
                 break; 
@@ -446,6 +451,7 @@ static int config_list(uint32_t key, GVariant **data, const struct sr_dev_inst *
 
         *data = std_gvar_samplerates(samplerates, num_samplerates);
         return SR_OK;
+    /* --- END OF IMPLEMENTED REPLACEMENT --- */
 
     case SR_CONF_TRIGGER_MATCH:
         *data = std_gvar_array_i32(trigger_matches, G_N_ELEMENTS(trigger_matches));
@@ -480,13 +486,28 @@ static void slogic_submit_raw_data(void *data, size_t len, const struct sr_dev_i
     struct dev_context *devc = sdi->priv;
     uint8_t *ptr = data;
     
+    if (!sdi || !devc || !data || len == 0)
+        return;
+
     g_mutex_lock(&devc->mutex); 
+    
+    // Safety check: If acquisition was already stopped elsewhere, drop incoming data
+    if (sdi->status != SR_ST_ACTIVE) {
+        g_mutex_unlock(&devc->mutex);
+        return;
+    }
+
     uint64_t nCh = devc->cur_samplechannel;
 
-	if (nCh < 8) {
+    if (nCh < 8) {
         size_t nsp_in_bytes = 8 / nCh;
         size_t unpacked_len = len * nsp_in_bytes;
-        ptr = g_malloc(unpacked_len);
+        ptr = g_try_malloc(unpacked_len);
+        if (!ptr) {
+            sr_err("Unpacking malloc failed at low channel count.");
+            g_mutex_unlock(&devc->mutex);
+            return;
+        }
 
         uint8_t *src = (uint8_t *)data;
         size_t dst_idx = 0;
@@ -494,7 +515,6 @@ static void slogic_submit_raw_data(void *data, size_t len, const struct sr_dev_i
 
         for (size_t src_idx = 0; src_idx < len; src_idx++) {
             uint8_t raw_byte = src[src_idx];
-            // Extract sub-samples from the single byte
             for (size_t sample = 0; sample < nsp_in_bytes; sample++) {
                 if (dst_idx < unpacked_len) {
                     ptr[dst_idx++] = (raw_byte >> (sample * nCh)) & mask;
@@ -504,11 +524,12 @@ static void slogic_submit_raw_data(void *data, size_t len, const struct sr_dev_i
         len = unpacked_len;
     }
 
+    // Prepare and dispatch datafeed packet
     struct sr_datafeed_logic logic;
     struct sr_datafeed_packet packet;
 
     logic.length = len;
-    logic.unitsize = 1; //(nCh + 7) / 8;
+    logic.unitsize = (nCh <= 8) ? 1 : 2; // 16 channels requires a 2-byte unitsize mapping!
     logic.data = ptr;
 
     packet.type = SR_DF_LOGIC;
@@ -518,6 +539,22 @@ static void slogic_submit_raw_data(void *data, size_t len, const struct sr_dev_i
 
     if (nCh < 8)
         g_free(ptr);
+
+    // Track and enforce sample limits for large acquisitions (like 50M)
+    if (devc->cur_limit_samples > 0) {
+        // Handle unitsize differences: 16 channels uses 2 bytes per sample point
+        size_t samples_received = (nCh <= 8) ? len : (len / 2);
+        devc->num_samples += samples_received;
+        
+        if (devc->num_samples >= devc->cur_limit_samples) {
+            sr_info("Target sample depth of %" PRIu64 " reached. Stopping acquisition.", devc->cur_limit_samples);
+            
+            // Unlock before calling stop to prevent recursive deadlocks if stop clears the mutex
+            g_mutex_unlock(&devc->mutex);
+            sr_dev_acquisition_stop((struct sr_dev_inst *)sdi);
+            return;
+        }
+    }
 
     g_mutex_unlock(&devc->mutex);
 }
@@ -603,26 +640,44 @@ static int slogic_basic_16_remote_run(const struct sr_dev_inst *sdi) {
             retry += 1;
             if (retry > 5)
                 return SR_ERR_TIMEOUT;
+            g_usleep(1000);
         } while (!(cmd_aux[2] & 0x01));
 
         unsigned int loop_guard = 0;
-        while (((uint16_t*)(cmd_aux + 4))[0] <= 1) {
+        while (1) {
             if (loop_guard++ > 50) {
                 sr_err("Clock division negotiation timed out. Aborting setup loop.");
+                slogic_basic_16_remote_stop(sdi);
                 return SR_ERR_TIMEOUT;
             }
 
+            // Read the current hardware clock layout
             slogic_usb_control_read(sdi, SLOGIC_BASIC_16_CONTROL_IN_REQ_REG_READ, SLOGIC_BASIC_16_R32_AUX + 4, 0x0000, cmd_aux + 4, (*(uint16_t*)cmd_aux) >> 9, 500);
 
-            uint64_t base = SR_MHZ(1) * ((uint16_t*)(cmd_aux + 4))[1];
-            if (base % devc->cur_samplerate) {
-                ((uint16_t*)(cmd_aux + 4))[0] += 1;
+            // Safely extract the profile attributes using explicit 16-bit array mapping
+            uint16_t *hw_profile = (uint16_t*)(cmd_aux + 4);
+            uint64_t base = SR_MHZ(1) * hw_profile[1]; // Evaluates cleanly to 200MHz or 800MHz
+            
+            if (base == 0) {
+                sr_err("Hardware reported an invalid base clock profile.");
+                return SR_ERR_DATA;
+            }
+
+            // If the current base clock profile cannot satisfy our target frequency, shift profiles
+            if (base < devc->cur_samplerate || (base % devc->cur_samplerate) != 0) {
+                hw_profile[0] += 1; // Try next clock index configuration profile
                 slogic_usb_control_write(sdi, SLOGIC_BASIC_16_CONTROL_OUT_REQ_REG_WRITE, SLOGIC_BASIC_16_R32_AUX + 4, 0x0000, cmd_aux + 4, 4, 500);
+                g_usleep(2000);
                 continue;
             }
-            uint32_t div = base / devc->cur_samplerate;
-            ((uint32_t*)(cmd_aux + 4))[1] = div;
+            
+            // Clean division matched! 
+            // CRITICAL FIX: Only change the divider scalar factor (hw_profile[1]), 
+            // leaving the rest of the layout telemetry untouched.
+            uint32_t target_div = base / devc->cur_samplerate;
+            hw_profile[1] = (uint16_t)target_div; 
 
+            // Send back the safely modified profile segment
             slogic_usb_control_write(sdi, SLOGIC_BASIC_16_CONTROL_OUT_REQ_REG_WRITE, SLOGIC_BASIC_16_R32_AUX + 4, 0x0000, cmd_aux + 4, (*(uint16_t*)cmd_aux) >> 9, 500);
             slogic_usb_control_read(sdi, SLOGIC_BASIC_16_CONTROL_IN_REQ_REG_READ, SLOGIC_BASIC_16_R32_AUX + 4, 0x0000, cmd_aux + 4, (*(uint16_t*)cmd_aux) >> 9, 500);
             break;

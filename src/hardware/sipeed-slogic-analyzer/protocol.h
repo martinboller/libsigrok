@@ -30,8 +30,8 @@
 #define LOG_PREFIX "sipeed-slogic-analyzer"
 
 #define USB_VID_SIPEED UINT16_C(0x359f)
-#define NUM_MAX_TRANSFERS 64
-#define TRANSFERS_DURATION_TOLERANCE 0.05f
+#define NUM_MAX_TRANSFERS 32
+#define TRANSFERS_DURATION_TOLERANCE 2
 
 enum {
 	PATTERN_MODE_NORMAL,
@@ -52,6 +52,11 @@ struct slogic_model {
 	void (*submit_raw_data)(void *data, size_t len, const struct sr_dev_inst *sdi);
 };
 
+struct raw_packet_chunk {
+    uint8_t *data;
+    size_t length;
+};
+
 struct dev_context {
 	struct slogic_model *model;
 
@@ -68,6 +73,7 @@ struct dev_context {
 		uint64_t cur_samplechannel;
 		int64_t cur_pattern_mode_idx;
 		size_t cur_threshold_idx;
+		uint64_t num_samples;
 	}; // configuration
 	
 	struct {

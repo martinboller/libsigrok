@@ -105,6 +105,21 @@ In order to get the libsigrok source code and build it, run:
  $ ./configure
  $ make
 
+
+With OpenJDK:
+Wipe out everything to destroy cached configure variables
+make distclean || make clean
+
+Export java stuff into your active environment shell
+export JAVAC=/usr/bin/javac
+export JAR=/usr/bin/jar
+
+Reconfigure and build
+./configure \
+  CPPFLAGS="-I/usr/lib/jvm/java-25-openjdk-amd64/include -I/usr/lib/jvm/java-25-openjdk-amd64/include/linux" \
+  CXXFLAGS="-O2 -g -Wno-error=deprecated-declarations" \
+  CFLAGS="-O2 -g -Wno-error=deprecated-declarations"
+
 For installing libsigrok:
 
  $ make install
