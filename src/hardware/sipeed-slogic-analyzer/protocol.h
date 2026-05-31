@@ -91,6 +91,7 @@ struct dev_context {
 		GThread *raw_data_handle_thread;
 		GAsyncQueue *raw_data_queue;
 		uint64_t timeout_count;
+		GMutex mutex;
 	}; // usb
 
 	int acq_aborted;
