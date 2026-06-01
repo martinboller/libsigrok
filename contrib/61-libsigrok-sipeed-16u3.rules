@@ -1,0 +1,10 @@
+# Sipeed SLogic Logic Analyzer permissions
+SUBSYSTEM!="usb|usb_device", GOTO="slogic_rules_end"
+ACTION!="add", GOTO="slogic_rules_end"
+
+# Grant access to all users (0666) and assign to plugdev/uaccess tags
+ATTRS{idVendor}=="359f", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+ENV{ID_MM_DEVICE_IGNORE}="1"
+
+LABEL="slogic_rules_end"
+
