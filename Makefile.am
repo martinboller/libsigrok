@@ -18,6 +18,7 @@
 ## along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ##
 
+UDEVRULESDIR = @UDEVRULESDIR@
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent
 GNUMAKEFLAGS = --no-print-directory
@@ -701,6 +702,12 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/siglent-sds/protocol.c \
 	src/hardware/siglent-sds/api.c
 endif
+if HW_SIPEED_SLOGIC_ANALYZER
+src_libdrivers_la_SOURCES += \
+	src/hardware/sipeed-slogic-analyzer/protocol.h \
+	src/hardware/sipeed-slogic-analyzer/protocol.c \
+	src/hardware/sipeed-slogic-analyzer/api.c
+endif
 if HW_SYSCLK_LWLA
 src_libdrivers_la_SOURCES += \
 	src/hardware/sysclk-lwla/lwla.h \
@@ -861,6 +868,7 @@ EXTRA_DIST = \
 	contrib/60-libsigrok.rules \
 	contrib/61-libsigrok-plugdev.rules \
 	contrib/61-libsigrok-uaccess.rules \
+	contrib/61-libsigrok-sipeed-16u3.rules \
 	src/minilzo/COPYING \
 	src/minilzo/Makefile \
 	src/minilzo/README.LZO \
@@ -1145,4 +1153,18 @@ dist-changelog:
 	else \
 		rm -f .ChangeLog.tmp; exit 1; \
 	fi
+	
 
+# Force copying of udev rules directly to the target path
+install-data-hook:
+	$(MKDIR_P) "$(DESTDIR)/etc/udev/rules.d"
+	$(INSTALL_DATA) $(srcdir)/contrib/60-libsigrok.rules "$(DESTDIR)/etc/udev/rules.d"
+	$(INSTALL_DATA) $(srcdir)/contrib/61-libsigrok-uaccess.rules "$(DESTDIR)/etc/udev/rules.d"
+	$(INSTALL_DATA) $(srcdir)/contrib/61-libsigrok-plugdev.rules "$(DESTDIR)/etc/udev/rules.d"
+	$(INSTALL_DATA) $(srcdir)/contrib/61-libsigrok-sipeed-16u3.rules "$(DESTDIR)/etc/udev/rules.d"
+
+uninstall-hook:
+	rm -f "$(DESTDIR)/etc/udev/rules.d/60-libsigrok.rules"
+	rm -f "$(DESTDIR)/etc/udev/rules.d/61-libsigrok-uaccess.rules"
+	rm -f "$(DESTDIR)/etc/udev/rules.d/61-libsigrok-plugdev.rules"
+	rm -f "$(DESTDIR)/etc/udev/rules.d/61-libsigrok-sipeed-16u3.rules"
